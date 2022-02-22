@@ -1,26 +1,31 @@
-import os 
 import pycuda.driver as cuda
 import pycuda.autoinit
 import cv2
 import tensorrt as trt
 import time
-import threading
 import numpy as np
-import sys
 import ctypes
-import random
 import socket
+
 
 CONF_THRESH=0.5
 IOU_THRESHOLD=0.4
 
-MIN_BLUE = (95,100,0)
-MAX_BLUE = (110,255,255)
+MIN_HBLUE = 80
+MAX_HBLUE = 120
 
-MIN_RED1 = (0,100,0)
-MAX_RED1 = (10,255,255)
-MIN_RED2 = (165,100,0)
-MAX_RED2 = (180,255,255)
+MIN_HRED1 = 0
+MAX_HRED1 = 20
+MIN_HRED2 = 165
+MAX_HRED2 = 180
+
+BALL_F = 653.8
+BALL_SIZE = 9.5
+
+WH_RATIO = 2
+
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
 
 engine_path = "model/exp12.engine"
 
@@ -268,72 +273,37 @@ class YoLov5TRT(object):
         boxes = np.stack(keep_boxes, 0) if len(keep_boxes) else np.array([])
         return boxes
 
+def calc_ball_dist(width):
+    return BALL_F*BALL_SIZE/width
 
-def plot_one_box(x, img, color=None, label=None, line_thickness=None):
-    """
-    description: Plots one bounding box on image img,
-                 this function comes from YoLov5 project.
-    param: 
-        x:      a box likes [x1,y1,x2,y2]
-        img:    a opencv image object
-        color:  color to draw rectangle, such as (0,255,0)
-        label:  str
-        line_thickness: int
-    return:
-        no return
-    """
-    tl = (
-        line_thickness or round(0.002 * (img.shape[0] + img.shape[1]) / 2) + 1
-    )  # line/font thickness
-    color = color or [random.randint(0, 255) for _ in range(3)]
-    c1, c2 = (int(x[0]), int(x[1])), (int(x[2]), int(x[3]))
-    cv2.rectangle(img, c1, c2, color, thickness=tl, lineType=cv2.LINE_AA)
-    # if label:
-    #     tf = max(tl - 1, 1)  # font thickness
-    #     t_size = cv2.getTextSize(label, 0, fontScale=tl / 3, thickness=tf)[0]
-    #     c2 = c1[0] + t_size[0], c1[1] - t_size[1] - 3
-    #     cv2.rectangle(img, c1, c2, color, -1, cv2.LINE_AA)  # filled
-    #     cv2.putText(
-    #         img,
-    #         label,
-    #         (c1[0], c1[1] - 2),
-    #         0,
-    #         tl / 3,
-    #         [225, 255, 255],
-    #         thickness=tf,
-    #         lineType=cv2.LINE_AA,
-    #     )
+def calc_degree(dist, dist_to_center):
+    return np.floor(np.arcsin(dist_to_center/dist)*180/3.14)
+
+def calc_ball_to_center(bbox, screen_width):
+    ball_dist_to_center_pix = np.abs(screen_width/2-(bbox[2]-bbox[0])/2)
+    ball_dist_to_center_inc = BALL_SIZE*ball_dist_to_center_pix/(bbox[2]-bbox[0])
+    return ball_dist_to_center_inc
 
 def findColor(img,bbox):
     hsv = cv2.cvtColor(img,cv2.COLOR_RGB2HSV)
-    blue = checkBlue(hsv,bbox)
-    red = checkRed(hsv,bbox)
-    area = (bbox[2]-bbox[0])*(bbox[3]-bbox[1])
-    if(area*COLOR_THRESH > max(blue,red)):
-        return -1
-    if blue > red:
+    hmean = np.mean(hsv[int(bbox[1]):int(bbox[3]),int(bbox[0]):int(bbox[2]),0])
+    if (hmean > MIN_HRED1 and hmean < MAX_HRED1) or (hmean > MIN_HRED2 and hmean < MAX_HRED2):
+        return RED
+    if (hmean > MIN_HBLUE and hmean < MAX_HBLUE):
         return BLUE
-    return RED
+    return -1
 
-def checkBlue(hsv, bbox):
-    thresh = cv2.inRange(hsv,MIN_BLUE,MAX_BLUE)
-    cntr = 0
-    for x in range(int(bbox[0]),int(bbox[2])):
-        for y in range(int(bbox[1]),int(bbox[3])):
-            cntr+=thresh[y][x]
-    return cntr
+def draw_box(img, box, color,label):
+    imgHeight, imgWidth, _ = img.shape
+    thick = (imgHeight + imgWidth) // 900
+    cv2.rectangle(img, (box[0], box[1]), (box[2], box[3]), color, thick)
+    cv2.putText(img, label, (int(box[0]), int(max(0,box[1] - 12))), 0, 1e-3 * imgHeight, color, 2)
 
-
-def checkRed(hsv, bbox):
-    thresh1 = cv2.inRange(hsv,MIN_RED1,MAX_RED1)
-    thresh2 = cv2.inRange(hsv,MIN_RED2,MIN_RED2)
-    thresh = cv2.bitwise_or(thresh1,thresh2)
-    cntr = 0
-    for x in range(int(bbox[0]),int(bbox[2])):
-        for y in range(int(bbox[1]),int(bbox[3])):
-            cntr+=thresh[y][x]
-    return cntr
-
+def convert_string(balls):
+    ballstr = str(len(balls))
+    for ball in balls:
+        ballstr += " " + str(ball[0]) + " " + str(ball[1])
+    return ballstr
 
 HOST = "10.1.14.2"
 PORT = 8888
@@ -343,25 +313,42 @@ PLUGIN_LIBRARY = "build/libmyplugins.so"
 ctypes.CDLL(PLUGIN_LIBRARY)
 
 cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH,640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT,480)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH,CAMERA_WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT,CAMERA_HEIGHT)
 inf = YoLov5TRT(engine_path)
 
 s = socket.socket(socket.AF_INET,socket.SOCK_STREAM)
-
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind((HOST,PORT))
 s.listen()
 conn, addr = s.accept()
 while True:
+    timer = cv2.getTickCount()
     ret, frame = cap.read()
     bboxes, conf, classes  = inf.infer(frame)
-    print(bboxes.ravel())
-    conn.send(bboxes.ravel())
+    # # print(bboxes.ravel())
+    finalbboxes = []
+    # format of distance, degree
+    finalballs = []
     for i, bbox in enumerate(bboxes):
         clr = findColor(frame,bbox)
         if clr == -1:
             continue
-        plot_one_box(bbox,frame,color=colors[clr],label=conf[i])
+        width = bbox[3]-bbox[1]
+        height = bbox[2]-bbox[0]
+        if width*WH_RATIO < height or height*WH_RATIO<width:
+            continue
+        dist = calc_ball_dist(max(width,height))
+        deg = calc_degree(dist,calc_ball_to_center(bbox,CAMERA_WIDTH))
+        label = "dist: " + str(np.floor(dist)) + " deg: " + str(np.floor(deg))
+        finalbboxes.append(bbox)
+        finalballs.append((np.floor(dist),np.floor(deg)))        
+        draw_box(frame,bbox,colors[clr],label)
+    
+    conn.send(bytes(convert_string(finalballs),'utf-8'))
+    fps = cv2.getTickFrequency() / (cv2.getTickCount()-timer)
+    # cv2.putText(frame,str(int(fps)), (0,50),cv2.FONT_HERSHEY_COMPLEX_SMALL,0.75,(0,255,0),2)
+    print(f"fps: {fps}")
     cv2.imshow("frame", frame)
     if cv2.waitKey(10) & 0xFF == ord('q'):
         break
