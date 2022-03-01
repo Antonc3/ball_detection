@@ -6,35 +6,7 @@ import time
 import numpy as np
 import ctypes
 import socket
-
-
-CONF_THRESH=0.5
-IOU_THRESHOLD=0.4
-
-MIN_HBLUE = 80
-MAX_HBLUE = 120
-
-MIN_HRED1 = 0
-MAX_HRED1 = 20
-MIN_HRED2 = 165
-MAX_HRED2 = 180
-
-BALL_F = 653.8
-BALL_SIZE = 9.5
-
-WH_RATIO = 2
-
-CAMERA_WIDTH = 640
-CAMERA_HEIGHT = 480
-
-engine_path = "model/exp12.engine"
-
-RED = 0
-BLUE = 1
-
-COLOR_THRESH = 0
-
-colors = [(255,0,0),(0,0,255)]
+from utils import config
 
 class YoLov5TRT(object):
     """
@@ -192,7 +164,7 @@ class YoLov5TRT(object):
         # Reshape to a two dimentional ndarray
         pred = np.reshape(output[1:], (-1, 6))[:num, :]
         # Do nms
-        boxes = self.non_max_suppression(pred, origin_h, origin_w, conf_thres=CONF_THRESH, nms_thres=IOU_THRESHOLD)
+        boxes = self.non_max_suppression(pred, origin_h, origin_w, conf_thres=config.CONF_THRESH, nms_thres=config.IOU_THRESHOLD)
         result_boxes = boxes[:, :4] if len(boxes) else np.array([])
         result_scores = boxes[:, 4] if len(boxes) else np.array([])
         result_classid = boxes[:, 5] if len(boxes) else np.array([])
@@ -274,23 +246,23 @@ class YoLov5TRT(object):
         return boxes
 
 def calc_ball_dist(width):
-    return BALL_F*BALL_SIZE/width
+    return config.BALL_F*config.BALL_SIZE/width
 
 def calc_degree(dist, dist_to_center):
     return np.floor(np.arcsin(dist_to_center/dist)*180/3.14)
 
 def calc_ball_to_center(bbox, screen_width):
-    ball_dist_to_center_pix = np.abs(screen_width/2-(bbox[2]-bbox[0])/2)
-    ball_dist_to_center_inc = BALL_SIZE*ball_dist_to_center_pix/(bbox[2]-bbox[0])
+    ball_dist_to_center_pix = np.abs(screen_width/2-(bbox[0]+(bbox[2]-bbox[0])/2))
+    ball_dist_to_center_inc = config.BALL_SIZE*ball_dist_to_center_pix/(bbox[2]-bbox[0])
     return ball_dist_to_center_inc
 
 def findColor(img,bbox):
     hsv = cv2.cvtColor(img,cv2.COLOR_RGB2HSV)
     hmean = np.mean(hsv[int(bbox[1]):int(bbox[3]),int(bbox[0]):int(bbox[2]),0])
-    if (hmean > MIN_HRED1 and hmean < MAX_HRED1) or (hmean > MIN_HRED2 and hmean < MAX_HRED2):
-        return RED
-    if (hmean > MIN_HBLUE and hmean < MAX_HBLUE):
-        return BLUE
+    if (hmean > config.MIN_HRED1 and hmean < config.MAX_HRED1) or (hmean > config.MIN_HRED2 and hmean < config.MAX_HRED2):
+        return config.RED
+    if (hmean > config.MIN_HBLUE and hmean < config.MAX_HBLUE):
+        return config.BLUE
     return -1
 
 def draw_box(img, box, color,label):
@@ -305,30 +277,26 @@ def convert_string(balls):
         ballstr += " " + str(ball[0]) + " " + str(ball[1])
     return ballstr
 
-HOST = "10.1.14.2"
-PORT = 8888
-HOST = "10.220.8.28"
-PLUGIN_LIBRARY = "build/libmyplugins.so"
-
-ctypes.CDLL(PLUGIN_LIBRARY)
-
+ctypes.CDLL(config.PLUGIN_LIBRARY)
+#set up camera
 cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH,CAMERA_WIDTH)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT,CAMERA_HEIGHT)
-inf = YoLov5TRT(engine_path)
-
-s = socket.socket(socket.AF_INET,socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind((HOST,PORT))
-s.listen()
-conn, addr = s.accept()
+cap.set(cv2.CAP_PROP_FRAME_WIDTH,config.CAMERA_WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT,config.CAMERA_HEIGHT)
+#set up model
+inf = YoLov5TRT(config.ENGINE_PATH)
+#set up sockets
+if(config.USE_SOCKETS):
+    print("Setting up sockets!")
+    s = socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((config.HOST,config.PORT))
+    s.listen()
+    conn, addr = s.accept()
 while True:
     timer = cv2.getTickCount()
     ret, frame = cap.read()
     bboxes, conf, classes  = inf.infer(frame)
-    # # print(bboxes.ravel())
-    finalbboxes = []
-    # format of distance, degree
+    #format of balls: distance, degree
     finalballs = []
     for i, bbox in enumerate(bboxes):
         clr = findColor(frame,bbox)
@@ -336,22 +304,28 @@ while True:
             continue
         width = bbox[3]-bbox[1]
         height = bbox[2]-bbox[0]
-        if width*WH_RATIO < height or height*WH_RATIO<width:
+        if width*config.WH_RATIO < height or height*config.WH_RATIO<width:
             continue
         dist = calc_ball_dist(max(width,height))
-        deg = calc_degree(dist,calc_ball_to_center(bbox,CAMERA_WIDTH))
+        deg = calc_degree(dist,calc_ball_to_center(bbox,config.CAMERA_WIDTH))
         label = "dist: " + str(np.floor(dist)) + " deg: " + str(np.floor(deg))
-        finalbboxes.append(bbox)
         finalballs.append((np.floor(dist),np.floor(deg)))        
-        draw_box(frame,bbox,colors[clr],label)
-    
-    conn.send(bytes(convert_string(finalballs),'utf-8'))
+        if config.DISPLAY_IMAGE:
+            draw_box(frame,bbox,config.COLORS[clr],label)
+    if config.USE_SOCKETS:
+        try:
+            conn.send(bytes(convert_string(finalballs),'utf-8'))
+        except: 
+            print("cannot send data :(")
+            break
     fps = cv2.getTickFrequency() / (cv2.getTickCount()-timer)
-    # cv2.putText(frame,str(int(fps)), (0,50),cv2.FONT_HERSHEY_COMPLEX_SMALL,0.75,(0,255,0),2)
+    
     print(f"fps: {fps}")
-    cv2.imshow("frame", frame)
-    if cv2.waitKey(10) & 0xFF == ord('q'):
-        break
+    if config.DISPLAY_IMAGE:
+        cv2.imshow("frame", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 inf.destroy()
-conn.close()
+if config.USE_SOCKETS:
+    conn.close()
 
